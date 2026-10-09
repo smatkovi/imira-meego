@@ -6,7 +6,7 @@ Fernseher oder Beamer übertragen. Vorbild ist
 GPL-3.0-or-later); portiert wird die Idee, nicht der Code: Imiras Technik hängt
 am Lipstick-Recorder, an droidmedia und an systemd, die es hier alle nicht gibt.
 
-**Stand:** Vorarbeiten, noch keine App. Was läuft, was nicht und warum, steht
+**Stand:** erste Fassung veröffentlicht ([v0.1.6](https://github.com/smatkovi/imira-meego/releases/tag/v0.1.6), deb am Release). Bild, Ton, Handschlag und Oberfläche laufen; offen ist der Beitritt zum Netz des Empfängers.
 mit Messwerten in [`notes/BEFUND.md`](notes/BEFUND.md).
 
 ## Was schon geht
