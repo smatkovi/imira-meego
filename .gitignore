@@ -1,0 +1,5 @@
+# Bauergebnisse und Pakete gehören nicht in den Baum.
+build/
+*.deb
+*.o
+__pycache__/

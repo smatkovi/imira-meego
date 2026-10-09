@@ -1,0 +1,11 @@
+[Desktop Entry]
+Encoding=UTF-8
+Version=1.0
+Type=Application
+Name=Imira
+Comment=Bildschirm auf einen Miracast-Empfänger übertragen
+Icon=/usr/share/icons/hicolor/80x80/apps/imira.png
+Exec=/opt/imira/bin/imira
+Terminal=false
+Categories=Network;
+X-Osso-Type=application/x-executable
