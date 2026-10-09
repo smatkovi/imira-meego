@@ -40,7 +40,7 @@ Caster::Caster(QObject *parent)
       fps_(settings_.value("fps", 20).toInt()),
       audio_(settings_.value("audio", true).toBool()),
       autoRotate_(settings_.value("autoRotate", true).toBool()),
-      scanning_(false)
+      scanning_(false), others_(0)
 {
     if (sizeIndex_ < 0 || sizeIndex_ >= kSizeCount) sizeIndex_ = 0;
     // icd2 schickt die Suchergebnisse nur an den, der gefragt hat -- und nur,
@@ -112,6 +112,7 @@ void Caster::scan()
 {
     if (scanning_) return;
     receivers_.clear();
+    others_ = 0;
     scanning_ = true;
     emit receiversChanged();
     note(QString::fromUtf8("suche Empfänger …"));
@@ -131,7 +132,8 @@ void Caster::scanDone()
 {
     if (!scanning_) return;
     scanning_ = false;
-    note(QString::fromUtf8("Suche fertig, %1 Empfänger").arg(receivers_.size()));
+    note(QString::fromUtf8("Suche fertig: %1 Empfänger, %2 gewöhnliche WLANs "
+                           "übergangen").arg(receivers_.size()).arg(others_));
     emit receiversChanged();
 }
 
@@ -174,16 +176,17 @@ void Caster::scanResult(const QDBusMessage &msg)
         return;
     }
 
-    // Miracast-Gruppen heißen DIRECT-xy-Name. Alles andere bleibt in der
-    // Liste, nur weiter unten: mancher Dongle spannt ein Netz mit eigenem
-    // Namen auf.
-    bool direct = name.startsWith("DIRECT-");
+    // Nur Miracast-Gruppen. Die Wi-Fi-Direct-Festlegung schreibt vor, dass
+    // die Kennung einer Gruppe mit "DIRECT-" beginnt -- das ist das einzige
+    // Merkmal, das ein Suchlauf über icd2 hergibt (P2P-Angaben trägt dieser
+    // Treiber nicht). Gewöhnliche WLANs werden nur gezählt, nicht gezeigt.
+    if (!name.startsWith("DIRECT-")) { others_++; return; }
     QVariantMap m;
     m["name"] = name;
     m["station"] = station;
     m["signal"] = signal;
-    m["direct"] = direct;
-    if (direct) receivers_.prepend(m); else receivers_.append(m);
+    m["direct"] = true;
+    receivers_.append(m);
     emit receiversChanged();
 }
 

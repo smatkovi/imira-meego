@@ -28,6 +28,7 @@ class Caster : public QObject
     Q_PROPERTY(QStringList sizeNames READ sizeNames CONSTANT)
     Q_PROPERTY(QVariantList receivers READ receivers NOTIFY receiversChanged)
     Q_PROPERTY(bool scanning READ scanning NOTIFY receiversChanged)
+    Q_PROPERTY(int others READ others NOTIFY receiversChanged)
 
 public:
     explicit Caster(QObject *parent = 0);
@@ -50,6 +51,7 @@ public:
 
     QVariantList receivers() const { return receivers_; }
     bool scanning() const { return scanning_; }
+    int others() const { return others_; }
 
 public slots:
     void scan();
@@ -77,6 +79,7 @@ private:
     QProcess *proc_;
     QVariantList receivers_;
     bool scanning_;
+    int others_;              /* gewoehnliche WLANs, nur gezaehlt */
     QSettings settings_;
     QStringList log_;
     QString state_;

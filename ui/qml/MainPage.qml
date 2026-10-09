@@ -42,6 +42,7 @@ Page {
         Label {
             text: caster.running ? caster.detail : qsTr("Empfänger")
             font.pixelSize: 32
+            color: "white"
         }
         Label {
             font.pixelSize: 18
@@ -51,8 +52,11 @@ Page {
                 if (caster.state === "verbunden") return qsTr("Empfänger meldet sich")
                 if (caster.state === "wartet") return qsTr("warte auf den Empfänger")
                 if (caster.state === "Fehler") return caster.detail
-                return caster.scanning ? qsTr("suche …")
-                     : qsTr("%1 gefunden").arg(caster.receivers.length)
+                if (caster.scanning) return qsTr("suche …")
+                if (caster.receivers.length === 0)
+                    return qsTr("keiner gefunden (%1 gewöhnliche WLANs übergangen)")
+                           .arg(caster.others)
+                return qsTr("%1 gefunden").arg(caster.receivers.length)
             }
         }
     }
@@ -78,19 +82,22 @@ Page {
                 spacing: 16
                 Image {
                     anchors.verticalCenter: parent.verticalCenter
-                    source: modelData.direct ? "image://theme/icon-m-common-video"
-                                             : "image://theme/icon-m-common-wlan"
+                    source: "image://theme/icon-m-common-video"
                 }
                 Column {
                     anchors.verticalCenter: parent.verticalCenter
                     width: parent.width - 120
-                    Label { text: modelData.name; font.pixelSize: 26 }
+                    Label {
+                        text: modelData.name
+                        font.pixelSize: 26
+                        color: "white"
+                        elide: Text.ElideRight
+                        width: parent.width
+                    }
                     Label {
                         font.pixelSize: 16
-                        color: modelData.direct ? "#88cc88" : "#808080"
-                        text: modelData.direct
-                              ? qsTr("Miracast-Gruppe · %1 dBm").arg(modelData.signal)
-                              : qsTr("WLAN · %1 dBm").arg(modelData.signal)
+                        color: "#9fd29f"
+                        text: qsTr("Miracast-Gruppe · %1 dBm").arg(modelData.signal)
                     }
                 }
             }
@@ -116,9 +123,10 @@ Page {
             font.pixelSize: 16
             color: "#707070"
             visible: !caster.running
-            text: qsTr("Miracast-Gruppen (DIRECT-…) stehen oben. Ist der "
-                     + "Empfänger nicht dabei, muss er sich erst zeigen — "
-                     + "manche tun das nur, solange ihr Startbild zu sehen ist.")
+            text: qsTr("Hier stehen nur Miracast-Empfänger (Gruppen, deren "
+                     + "Kennung mit DIRECT- beginnt). Ist deiner nicht dabei, "
+                     + "muss er sich erst zeigen — manche tun das nur, solange "
+                     + "ihr Startbild auf dem Fernseher steht.")
         }
         Button {
             width: parent.width
