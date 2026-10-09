@@ -437,3 +437,43 @@ OK`). Dabei kam heraus, dass `Qt.quit()` ohne
 
 Paket `imira_0.1.6_armel.deb`: Oberfläche, Technik, Startereintrag und Symbol
 in einem, Installation per `aegis-dpkg`.
+
+## 09.10.2026, dreizehnter Durchgang: Tempo bei bewegtem Bild
+
+Der Abgriff wurde Schritt für Schritt vermessen (castd meldet jetzt die Zeit
+je Arbeitsschritt) und daraufhin umgebaut. 848x480, ruhiger Bildschirm:
+
+| Fassung | quer | hochkant |
+|---|---|---|
+| 2.0 (ganzes Bild drehen, dann ganzes Bild wandeln) | 19,1 ms / 63 % CPU | 19 ms |
+| 2.3 (Bänder + zeilenweise wandeln in einem Durchgang) | 12,4 ms / 44 % | 11,6 ms / 42 % |
+| 2.5 (quer ohne Zwischenabzug) | **6,7 ms / 30 %** | 11,7 ms / 45 % |
+
+Drei Schritte, drei Einsichten:
+
+1. **Die Umrechnung las jede Zeile zweimal** (einmal für die Helligkeit,
+   einmal für die Farbe) und arbeitete über das ganze Bild — 820 kB passen in
+   keinen Zwischenspeicher. Jetzt eine Zeile, ein Durchgang, `vld2q`/`vst2q`
+   für gerade und ungerade Punkte: aus 8,0 ms wurde ein Teil der 6,5 ms, die
+   das ganze Drehen-und-Wandeln noch kostet.
+2. **Zeilenweise sammeln war ein Rückschritt** (50,9 ms bei 640x480 hochkant):
+   die Quellpunkte einer Zielzeile liegen beim Drehen 1712 Byte auseinander,
+   das ist ein Fehlgriff je Punkt. Jetzt in **Bändern** von 16 Zeilen, mit den
+   Quellzeilen außen — je Quellzeile werden 16 benachbarte Spalten geholt, und
+   das Band (27 kB) bleibt im Zwischenspeicher.
+3. **Quer braucht es den Zwischenabzug der ganzen Seite gar nicht.** Wenn die
+   Zielbreite nahe an der des Bildschirms liegt (848 von 854), wird
+   **beschnitten statt skaliert** — aus dem Sammeln wird ein `memcpy`, und das
+   kann direkt aus dem Framebuffer kommen (281 MB/s über mmap). Spart die
+   vollen 4,3 ms des Abzugs.
+
+**Was nichts gebracht hat:** eine bessere Nettigkeit für den Abgriff. Unter
+einer Speicherlast lief er mit Nettigkeit 0 genauso schnell wie mit -10
+(7,4 gegen 10,6 ms). Der Schalter `-P` bleibt, die Vorgabe ist 0.
+
+**Ehrlich dazu:** ein einzelner Lauf zeigte unter Speicherlast einmal 44,3 ms
+je Bild bei nur 18 % eigener Rechenzeit — der Abgriff wartete also, statt zu
+rechnen. Mit dem neuen Code war das nicht mehr nachzustellen (7,4 ms unter
+derselben Last). Auf dem Gerät arbeitet zwischendurch auch eine andere
+Sitzung; ob der Ausreißer daher kam, ist offen. Was ein wirklich bewegter
+Bildschirm kostet, lässt sich erst am entsperrten Gerät messen.

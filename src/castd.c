@@ -28,6 +28,7 @@
 #include <linux/fb.h>
 #include <time.h>
 #include <sys/resource.h>
+#include <sched.h>
 #include <glib.h>
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
@@ -39,6 +40,7 @@
 #endif
 
 #define TILE 32          /* Kachelbreite beim Drehen, gemessen am besten */
+#define BAND 16          /* Zeilen je Durchgang -- ein Band bleibt im Zwischenspeicher */
 
 struct cast {
     int fd;
@@ -67,93 +69,88 @@ struct cast {
     long long apackets;
     GstElement *apipe;        /* eigene Pipeline fuer den Ton */
     long long t0_us;          /* gemeinsamer Nullpunkt fuer Bild und Ton */
-    unsigned short *rot;      /* Zwischenbild: gedrehtes RGB565 */
+    unsigned short *band;     /* BAND Zeilen RGB565, zusammengetragen */
     int ox, oy, cw, ch;       /* Inhaltsfeld im Zielbild (Rest bleibt schwarz) */
     int stretch;              /* 1 = fuellen statt Seitenverhaeltnis wahren */
+    int crop_x;               /* >=0: quer wird beschnitten statt skaliert */
     int auto_rot;             /* 1 = Lage beim Compositor erfragen */
     long long last_orient;    /* wann zuletzt gefragt (us) */
     int noalloc;              /* 1 = Kodierer gab keinen Puffer her */
     GMainLoop *loop;
     GstClockTime pts;
     long long t0, grab_us;      /* Start und reine Abgriffszeit */
+    long long copy_us, rot_us, conv_us;   /* je Arbeitsschritt */
 };
 
-/* RGB565 (gedreht, fortlaufend) -> I420, acht Bildpunkte je Schritt.
+/* Eine Zeile RGB565 -> I420, sechzehn Bildpunkte je Schritt.
  *
- * Warum zwei Gaenge statt einem: beim Drehen kommen die Quellpunkte
- * spaltenweise, das laesst sich nicht buendeln. Ist das Bild erst gedreht,
- * liegt es fortlaufend -- und dann rechnet NEON acht Punkte auf einmal.
- * Y = (66R + 129G + 25B + 4224) >> 8 passt in 16 Bit ohne Vorzeichen;
- * die Farbdifferenzen passen mit Vorzeichen, wenn erst geschoben und dann
- * 128 addiert wird.
+ * Zeilenweise statt über das ganze Bild, und Helligkeit und Farbe in
+ * **einem** Durchgang: vorher wurde jede Zeile zweimal gelesen (einmal für Y,
+ * einmal für die Farbdifferenzen), und das Zwischenbild war mit 820 kB viel
+ * zu groß für den Zwischenspeicher. Eine Zeile sind 1,7 kB und bleibt im L1.
+ *
+ * Y = (66R + 129G + 25B + 4224) >> 8 passt in 16 Bit ohne Vorzeichen; die
+ * Farbdifferenzen passen mit Vorzeichen, wenn erst geschoben und dann 128
+ * addiert wird. u/v dürfen NULL sein (ungerade Zeilen).
  */
-static void rgb565_to_i420(const unsigned short *src, int w, int h,
-                           unsigned char *yp, unsigned char *up,
-                           unsigned char *vp)
+static void rgb565_row_to_i420(const unsigned short *s, int w,
+                               unsigned char *yp, unsigned char *up,
+                               unsigned char *vp)
 {
+    int x = 0;
 #ifdef __ARM_NEON__
-    int cw = w / 2;
-    for (int y = 0; y < h; y++) {
-        const unsigned short *sl = src + (size_t)y * w;
-        unsigned char *yl = yp + (size_t)y * w;
-        int x = 0;
-        for (; x + 8 <= w; x += 8) {
-            uint16x8_t px = vld1q_u16(sl + x);
-            uint16x8_t r = vshlq_n_u16(vshrq_n_u16(px, 11), 3);
-            uint16x8_t g = vshlq_n_u16(vandq_u16(vshrq_n_u16(px, 5),
-                                                 vdupq_n_u16(0x3f)), 2);
-            uint16x8_t b = vshlq_n_u16(vandq_u16(px, vdupq_n_u16(0x1f)), 3);
-            uint16x8_t acc = vmlaq_n_u16(vdupq_n_u16(4224), r, 66);
-            acc = vmlaq_n_u16(acc, g, 129);
-            acc = vmlaq_n_u16(acc, b, 25);
-            vst1_u8(yl + x, vshrn_n_u16(acc, 8));
-        }
-        for (; x < w; x++) {
-            unsigned short p = sl[x];
-            int R = ((p >> 11) & 0x1f) << 3, G = ((p >> 5) & 0x3f) << 2,
-                B = (p & 0x1f) << 3;
-            yl[x] = (unsigned char)((66*R + 129*G + 25*B + 4224) >> 8);
-        }
-        if (y & 1) continue;
-        unsigned char *ul = up + (size_t)(y >> 1) * cw;
-        unsigned char *vl = vp + (size_t)(y >> 1) * cw;
-        x = 0;
-        for (; x + 16 <= w; x += 16) {
-            /* vld2q trennt gerade und ungerade Punkte: wir nehmen die geraden */
-            uint16x8x2_t two = vld2q_u16(sl + x);
-            uint16x8_t px = two.val[0];
-            int16x8_t r = vreinterpretq_s16_u16(
-                    vshlq_n_u16(vshrq_n_u16(px, 11), 3));
-            int16x8_t g = vreinterpretq_s16_u16(
-                    vshlq_n_u16(vandq_u16(vshrq_n_u16(px, 5),
-                                          vdupq_n_u16(0x3f)), 2));
-            int16x8_t b = vreinterpretq_s16_u16(
-                    vshlq_n_u16(vandq_u16(px, vdupq_n_u16(0x1f)), 3));
+    for (; x + 16 <= w; x += 16) {
+        /* vld2q trennt gerade und ungerade Punkte -- die geraden tragen die
+         * Farbe, beide zusammen die Helligkeit. So wird jeder Punkt genau
+         * einmal geladen. */
+        uint16x8x2_t two = vld2q_u16(s + x);
+        uint16x8_t pe = two.val[0], po = two.val[1];
+
+        uint16x8_t re = vshlq_n_u16(vshrq_n_u16(pe, 11), 3);
+        uint16x8_t ge = vshlq_n_u16(vandq_u16(vshrq_n_u16(pe, 5), vdupq_n_u16(0x3f)), 2);
+        uint16x8_t be = vshlq_n_u16(vandq_u16(pe, vdupq_n_u16(0x1f)), 3);
+        uint16x8_t ro = vshlq_n_u16(vshrq_n_u16(po, 11), 3);
+        uint16x8_t go = vshlq_n_u16(vandq_u16(vshrq_n_u16(po, 5), vdupq_n_u16(0x3f)), 2);
+        uint16x8_t bo = vshlq_n_u16(vandq_u16(po, vdupq_n_u16(0x1f)), 3);
+
+        uint16x8_t ye = vmlaq_n_u16(vdupq_n_u16(4224), re, 66);
+        ye = vmlaq_n_u16(ye, ge, 129); ye = vmlaq_n_u16(ye, be, 25);
+        uint16x8_t yo = vmlaq_n_u16(vdupq_n_u16(4224), ro, 66);
+        yo = vmlaq_n_u16(yo, go, 129); yo = vmlaq_n_u16(yo, bo, 25);
+        /* vst2 setzt gerade und ungerade wieder ineinander */
+        uint8x8x2_t yy;
+        yy.val[0] = vshrn_n_u16(ye, 8);
+        yy.val[1] = vshrn_n_u16(yo, 8);
+        vst2_u8(yp + x, yy);
+
+        if (up) {
+            int16x8_t r = vreinterpretq_s16_u16(re);
+            int16x8_t g = vreinterpretq_s16_u16(ge);
+            int16x8_t b = vreinterpretq_s16_u16(be);
             int16x8_t u = vmlsq_n_s16(vmulq_n_s16(b, 112), r, 38);
             u = vmlsq_n_s16(u, g, 74);
             int16x8_t v = vmlsq_n_s16(vmulq_n_s16(r, 112), g, 94);
             v = vmlsq_n_s16(v, b, 18);
-            vst1_u8(ul + (x >> 1), vqmovun_s16(vaddq_s16(vshrq_n_s16(u, 8),
+            vst1_u8(up + (x >> 1), vqmovun_s16(vaddq_s16(vshrq_n_s16(u, 8),
                                                          vdupq_n_s16(128))));
-            vst1_u8(vl + (x >> 1), vqmovun_s16(vaddq_s16(vshrq_n_s16(v, 8),
+            vst1_u8(vp + (x >> 1), vqmovun_s16(vaddq_s16(vshrq_n_s16(v, 8),
                                                          vdupq_n_s16(128))));
-        }
-        for (; x < w; x += 2) {
-            unsigned short p = sl[x];
-            int R = ((p >> 11) & 0x1f) << 3, G = ((p >> 5) & 0x3f) << 2,
-                B = (p & 0x1f) << 3;
-            ul[x >> 1] = (unsigned char)(((112*B - 38*R - 74*G) >> 8) + 128);
-            vl[x >> 1] = (unsigned char)(((112*R - 94*G - 18*B) >> 8) + 128);
         }
     }
-#else
-    (void)src; (void)w; (void)h; (void)yp; (void)up; (void)vp;
 #endif
+    for (; x < w; x++) {
+        unsigned short p = s[x];
+        int R = ((p >> 11) & 0x1f) << 3, G = ((p >> 5) & 0x3f) << 2,
+            B = (p & 0x1f) << 3;
+        yp[x] = (unsigned char)((66*R + 129*G + 25*B + 4224) >> 8);
+        if (up && !(x & 1)) {
+            up[x >> 1] = (unsigned char)(((112*B - 38*R - 74*G) >> 8) + 128);
+            vp[x >> 1] = (unsigned char)(((112*R - 94*G - 18*B) >> 8) + 128);
+        }
+    }
 }
 
 
-/* Der Kodierer hat ein Bild fertig: als MPEG-TS verpacken und wegschicken.
- * Laeuft im Stromfaden von GStreamer -- nur dieser Faden fasst tssink an. */
 static long long now_us(void);
 
 /* Ton aus der Mitschnitt-Quelle: als LPCM in denselben Transportstrom.
@@ -210,17 +207,26 @@ static void set_rotation(struct cast *c, int deg)
         c->ox = ((c->dw - c->cw) / 2) & ~1;
         c->oy = ((c->dh - c->ch) / 2) & ~1;
     }
+    /* Quer liegt die Breite oft dicht an der des Bildschirms (848 von 854).
+     * Dann lieber die paar Spalten am Rand abschneiden als jeden Punkt
+     * einzeln zu holen: so wird aus dem Sammeln ein memcpy. Unter zwei
+     * Prozent Unterschied sieht das niemand. */
+    c->crop_x = -1;
+    if (!(deg == 90 || deg == 270) && c->cw <= c->sw &&
+        (long long)c->cw * 100 >= (long long)c->sw * 98)
+        c->crop_x = (c->sw - c->cw) / 2;
     for (int i = 0; i < c->cw; i++) {
         c->mapx[i]  = (int)((long long)i * c->sh / c->cw);
-        c->mapx0[i] = (int)((long long)i * c->sw / c->cw);
+        c->mapx0[i] = c->crop_x >= 0 ? c->crop_x + i
+                                     : (int)((long long)i * c->sw / c->cw);
     }
     for (int i = 0; i < c->ch; i++) {
         c->mapy[i]  = (int)((long long)i * c->sw / c->ch);
         c->mapy0[i] = (int)((long long)i * c->sh / c->ch);
     }
-    if (c->rot) memset(c->rot, 0, (size_t)c->dw * c->dh * 2);  /* Rand schwarz */
-    fprintf(stderr, "Lage %d Grad, Inhaltsfeld %dx%d bei %d,%d in %dx%d\n",
-            deg, c->cw, c->ch, c->ox, c->oy, c->dw, c->dh);
+    fprintf(stderr, "Lage %d Grad, Inhaltsfeld %dx%d bei %d,%d in %dx%d%s\n",
+            deg, c->cw, c->ch, c->ox, c->oy, c->dw, c->dh,
+            c->crop_x >= 0 ? " (beschnitten statt skaliert)" : "");
 }
 
 
@@ -269,53 +275,109 @@ static gboolean grab(gpointer data)
      * 1712 B Schrittweite); kopieren kostet 2,9 ms (281 MB/s) und das Drehen
      * aus dem Arbeitsspeicher in 32er-Kacheln noch 11,7 ms -- zusammen
      * fuenfeinhalbmal schneller. Alles am N950 nachgemessen (src/fbbench.c). */
-    memcpy(c->copy, page, c->pagesz);
-    const unsigned char *src = c->copy;
+    /* Der Zwischenabzug der ganzen Seite ist nur nötig, wo wir wild im Bild
+     * herumgreifen (drehen oder skalieren): aus dem Framebuffer selbst ist
+     * ein einzelner Punkt teuer, eine ganze Zeile am Stück aber nicht
+     * (gemessen: 281 MB/s über mmap). Quer und unskaliert lesen wir deshalb
+     * direkt -- das spart 4 ms je Bild. */
+    const unsigned char *src;
+    if (c->neon && (c->rot_deg == 0) && c->crop_x >= 0) {
+        src = page;
+    } else {
+        long long t_copy = now_us();
+        memcpy(c->copy, page, c->pagesz);
+        c->copy_us += now_us() - t_copy;
+        src = c->copy;
+    }
 
     if (c->neon) {
-        /* Erst ins Zwischenbild bringen (RGB565 bleibt RGB565), dann mit NEON
-         * wandeln. Die Lage ist einstellbar, weil der Framebuffer der Drehung
-         * der Oberflaeche folgt: eine Hochkant-Ansicht liegt im Puffer quer,
-         * eine Quer-Ansicht liegt gerade. Bei 0 und 180 Grad geht es
-         * zeilenweise (schnell), bei 90 und 270 in Kacheln. */
-        if (c->rot_deg == 0 || c->rot_deg == 180) {
-            int flip = (c->rot_deg == 180);
-            for (int y = 0; y < c->ch; y++) {
-                int sy = flip ? c->sh - 1 - c->mapy0[y] : c->mapy0[y];
-                const unsigned short *sl = (const unsigned short *)
-                        (src + (size_t)sy * c->stride);
-                unsigned short *row = c->rot + (size_t)(y + c->oy) * c->dw + c->ox;
-                if (flip)
-                    for (int x = 0; x < c->cw; x++)
-                        row[x] = sl[c->sw - 1 - c->mapx0[x]];
-                else
-                    for (int x = 0; x < c->cw; x++)
-                        row[x] = sl[c->mapx0[x]];
+        /* Zeilenweise: eine Zeile zusammentragen (drehen und skalieren) und
+         * gleich wandeln. Das Zwischenbild über das ganze Bild ist weg -- eine
+         * Zeile sind 1,7 kB und bleibt im schnellen Zwischenspeicher, während
+         * 820 kB jedes Mal durch den Hauptspeicher mussten. Wo nichts zu
+         * sammeln ist (quer, ohne Skalieren), wandelt NEON direkt aus dem
+         * Abzug des Bildschirms. */
+        long long t_rot = now_us();
+        unsigned char *yp = GST_BUFFER_DATA(buf);
+        unsigned char *up = yp + (size_t)c->dw * c->dh;
+        unsigned char *vp = up + (size_t)c->dw * c->dh / 4;
+        const int dw = c->dw, dh = c->dh, cw = c->cw, ch = c->ch;
+        const int ox = c->ox, oy = c->oy, cwh = dw / 2;
+
+        /* Rand schwarz: der Puffer kommt aus dem Vorrat des Kodierers und
+         * trägt noch das vorige Bild. Schwarz ist Y=16, U=V=128. */
+        if (oy > 0 || ox > 0) {
+            for (int y = 0; y < dh; y++) {
+                unsigned char *yl = yp + (size_t)y * dw;
+                if (y < oy || y >= oy + ch) {
+                    memset(yl, 16, dw);
+                } else if (ox > 0) {
+                    memset(yl, 16, ox);
+                    memset(yl + ox + cw, 16, dw - ox - cw);
+                }
             }
-        } else {
-            int ccw = (c->rot_deg == 270);
-            for (int ty = 0; ty < c->ch; ty += TILE) {
-                int ylim = ty + TILE < c->ch ? ty + TILE : c->ch;
-                for (int tx = 0; tx < c->cw; tx += TILE) {
-                    int xlim = tx + TILE < c->cw ? tx + TILE : c->cw;
-                    for (int y = ty; y < ylim; y++) {
-                        int sx = ccw ? c->sw - 1 - c->mapy[y] : c->mapy[y];
-                        unsigned short *row = c->rot + (size_t)(y + c->oy) * c->dw + c->ox;
-                        for (int x = tx; x < xlim; x++) {
-                            int sy = ccw ? c->mapx[x] : c->sh - 1 - c->mapx[x];
-                            row[x] = *((const unsigned short *)
-                                       (src + (size_t)sy * c->stride) + sx);
-                        }
-                    }
+            for (int y = 0; y < dh / 2; y++) {
+                unsigned char *ul = up + (size_t)y * cwh;
+                unsigned char *vl = vp + (size_t)y * cwh;
+                if (2 * y < oy || 2 * y >= oy + ch) {
+                    memset(ul, 128, cwh); memset(vl, 128, cwh);
+                } else if (ox > 0) {
+                    memset(ul, 128, ox / 2); memset(vl, 128, ox / 2);
+                    memset(ul + (ox + cw) / 2, 128, cwh - (ox + cw) / 2);
+                    memset(vl + (ox + cw) / 2, 128, cwh - (ox + cw) / 2);
                 }
             }
         }
-        {
-            unsigned char *yp = GST_BUFFER_DATA(buf);
-            unsigned char *up = yp + (size_t)c->dw * c->dh;
-            unsigned char *vp = up + (size_t)c->dw * c->dh / 4;
-            rgb565_to_i420(c->rot, c->dw, c->dh, yp, up, vp);
+
+        const int straight = (c->rot_deg == 0 || c->rot_deg == 180);
+        const int flip = (c->rot_deg == 180);
+        const int ccw = (c->rot_deg == 270);
+        /* In Bändern von BAND Zeilen: beim Drehen liegen die Quellpunkte einer
+         * Zielzeile spaltenweise, 1712 Byte auseinander -- jede Zeile für sich
+         * zu sammeln heißt ein Fehlgriff je Punkt (gemessen: 50,9 ms bei
+         * 640x480 hochkant). Ein Band deckt BAND benachbarte Quellspalten ab;
+         * wer die Quellzeilen außen durchläuft, holt sie mit ein, zwei
+         * Zugriffen. Das Band selbst (16 x 848 x 2 = 27 kB) bleibt im
+         * Zwischenspeicher. */
+        for (int by = 0; by < ch; by += BAND) {
+            int bh = by + BAND < ch ? BAND : ch - by;
+            if (straight) {
+                for (int k = 0; k < bh; k++) {
+                    int y = by + k;
+                    int sy = flip ? c->sh - 1 - c->mapy0[y] : c->mapy0[y];
+                    const unsigned short *sl = (const unsigned short *)
+                            (src + (size_t)sy * c->stride);
+                    unsigned short *d = c->band + (size_t)k * cw;
+                    if (!flip && c->crop_x >= 0)
+                        memcpy(d, sl + c->crop_x, (size_t)cw * 2);
+                    else if (flip)
+                        for (int x = 0; x < cw; x++) d[x] = sl[c->sw - 1 - c->mapx0[x]];
+                    else
+                        for (int x = 0; x < cw; x++) d[x] = sl[c->mapx0[x]];
+                }
+            } else {
+                /* Quellzeilen außen, Bandzeilen innen: je Quellzeile werden
+                 * BAND benachbarte Spalten geholt. */
+                for (int x = 0; x < cw; x++) {
+                    int sy = ccw ? c->mapx[x] : c->sh - 1 - c->mapx[x];
+                    const unsigned short *sl = (const unsigned short *)
+                            (src + (size_t)sy * c->stride);
+                    for (int k = 0; k < bh; k++) {
+                        int sx = ccw ? c->sw - 1 - c->mapy[by + k] : c->mapy[by + k];
+                        c->band[(size_t)k * cw + x] = sl[sx];
+                    }
+                }
+            }
+            for (int k = 0; k < bh; k++) {
+                int dy = by + k + oy;
+                int even = !(dy & 1);
+                rgb565_row_to_i420(c->band + (size_t)k * cw, cw,
+                                   yp + (size_t)dy * dw + ox,
+                                   even ? up + (size_t)(dy >> 1) * cwh + (ox >> 1) : NULL,
+                                   even ? vp + (size_t)(dy >> 1) * cwh + (ox >> 1) : NULL);
+            }
         }
+        c->rot_us += now_us() - t_rot;
         goto pushed;
     }
 
@@ -450,9 +512,9 @@ int main(int argc, char **argv)
 
     int i420 = 0, vpp = 0, neon = 0, rot_deg = 90, ts_mode = 0;
     int keyint = 1, bitrate = 0, csd_every = 0, intra = 0, stretch = 0;
-    int auto_rot = 0;
+    int auto_rot = 0, nice_level = 0;
     const char *amon = "sink.music.monitor";
-    while ((opt = getopt(argc, argv, "d:w:h:f:n:H:p:u:S:IVNr:Tk:b:K:RsA:")) != -1) {
+    while ((opt = getopt(argc, argv, "d:w:h:f:n:H:p:u:S:IVNr:Tk:b:K:RsA:P:")) != -1) {
         switch (opt) {
         case 'd': dev = optarg; break;
         case 'w': c.dw = atoi(optarg); break;
@@ -476,6 +538,7 @@ int main(int argc, char **argv)
         case 'K': csd_every = atoi(optarg); break;
         case 'R': intra = 1; break;
         case 's': stretch = 1; break;  /* fuellen statt Balken */
+        case 'P': nice_level = atoi(optarg); break;
         case 'A': amon = optarg; break;  /* Mitschnitt-Quelle, "off" = stumm */
         default:
             fprintf(stderr,
@@ -493,7 +556,8 @@ int main(int argc, char **argv)
                 "  -R: laufende Intra-Auffrischung im Kodierer\n"
                 "  -s: Bild fuellen statt Seitenverhaeltnis wahren\n"
                 "  -A: Mitschnitt-Quelle fuer den Ton (Vorgabe\n"
-                "      sink.music.monitor; `off` schaltet den Ton ab)\n",
+                "      sink.music.monitor; `off` schaltet den Ton ab)\n"
+                "  -P: Nettigkeit des Abgriffs (Vorgabe 0; bringt gemessen nichts)\n",
                 argv[0]);
             return 2;
         }
@@ -516,6 +580,18 @@ int main(int argc, char **argv)
     fprintf(stderr, "fb %dx%d, Zeile %d B, virtuell %ux%u -> %dx%d @ %d/s\n",
             c.sw, c.sh, c.stride, vi.xres_virtual, vi.yres_virtual,
             c.dw, c.dh, c.fps);
+
+    /* --- Vorfahrt sichern, solange wir noch root sind --------------------- */
+    /* Nachgemessen bringt die Vorfahrt nichts: unter derselben Speicherlast
+     * lief der Abgriff mit Nettigkeit 0 genauso schnell wie mit -10 (7,4
+     * gegen 10,6 ms, also eher schlechter). Deshalb standardmäßig aus -- wer
+     * sie doch braucht, nimmt -P. */
+    if (getuid() == 0 && nice_level) {
+        if (setpriority(PRIO_PROCESS, 0, nice_level) == 0)
+            fprintf(stderr, "Vorfahrt: Nettigkeit %d\n", nice_level);
+        else
+            perror("setpriority");
+    }
 
     /* --- Rechte ablegen, bevor GStreamer anfaengt ------------------------- */
     if (getuid() == 0) {
@@ -545,8 +621,8 @@ int main(int argc, char **argv)
     c.i420 = i420 && !neon;
     c.vpp = vpp && !i420 && !neon;
     if (c.neon) {
-        c.rot = calloc((size_t)c.dw * c.dh, 2);   /* schwarzer Rand, einmal */
-        if (!c.rot) { fprintf(stderr, "kein Speicher fuers Zwischenbild\n"); return 1; }
+        c.band = malloc((size_t)c.dw * BAND * 2);
+        if (!c.band) { fprintf(stderr, "kein Speicher fuer das Band\n"); return 1; }
     }
     c.auto_rot = auto_rot;
     if (auto_rot && orient_open() == 0) {
@@ -679,6 +755,10 @@ int main(int argc, char **argv)
     }
     {
         double dt = (now_us() - c.t0) / 1e6;
+        if (c.frames) fprintf(stderr,
+                "je Bild: kopieren %.1f ms, drehen %.1f ms, wandeln %.1f ms\n",
+                c.copy_us / 1000.0 / c.frames, c.rot_us / 1000.0 / c.frames,
+                c.conv_us / 1000.0 / c.frames);
         fprintf(stderr, "%lld Bilder in %.1f s = %.1f/s (Ziel %d/s), "
                 "Abgriff je Bild %.1f ms\n", c.frames, dt,
                 dt > 0 ? c.frames / dt : 0.0, c.fps,
